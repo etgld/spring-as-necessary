@@ -1,0 +1,18 @@
+[project]
+name = "spring-as-necessary"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+ "cached_property",
+	"networkx",
+	"penman>=1.1.0",
+	"pytorch-ignite",
+	"regex",
+	"sacrebleu",
+	"smatch",
+	"transformers>=3.0.0",
+	"wandb",
+	"PyYAML>=5.1",
+]
