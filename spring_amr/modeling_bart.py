@@ -1,27 +1,30 @@
-import copy
 import math
 import random
 from typing import *
 
 import torch
-from torch import Tensor
-from torch import nn
+from torch import Tensor, nn
 from torch.nn import functional as F
 from transformers import modeling_bart as bart
-from transformers.modeling_utils import BeamHypotheses, calc_banned_ngram_tokens, calc_banned_bad_words_ids, \
-    top_k_top_p_filtering
+from transformers.modeling_utils import (
+    BeamHypotheses,
+    calc_banned_bad_words_ids,
+    calc_banned_ngram_tokens,
+    top_k_top_p_filtering,
+)
+
 
 def extract_backreferences(ids, num_embeddings, backpointer_idx):
     ids_mask = ids >= num_embeddings
     backreferences = ids.clone() - num_embeddings
     backreferences[~ids_mask] = 0
     backreferences += (~ids_mask).long() * torch.arange(
-        ids.size(1),
-        dtype=ids.dtype,
-        device=ids.device)
+        ids.size(1), dtype=ids.dtype, device=ids.device
+    )
     ids = ids.clone()
     ids[ids_mask] = backpointer_idx
     return ids, backreferences
+
 
 class AMRBartEncoder(nn.Module):
     """
@@ -55,17 +58,27 @@ class AMRBartEncoder(nn.Module):
             )
         else:
             self.embed_positions = bart.LearnedPositionalEmbedding(
-                config.max_position_embeddings, embed_dim, self.padding_idx, #config.extra_pos_embeddings,
+                config.max_position_embeddings,
+                embed_dim,
+                self.padding_idx,  # config.extra_pos_embeddings,
             )
 
-        self.layers = nn.ModuleList([bart.EncoderLayer(config) for _ in range(config.encoder_layers)])
-        self.layernorm_embedding = bart.LayerNorm(embed_dim) if config.normalize_embedding else nn.Identity()
+        self.layers = nn.ModuleList(
+            [bart.EncoderLayer(config) for _ in range(config.encoder_layers)]
+        )
+        self.layernorm_embedding = (
+            bart.LayerNorm(embed_dim) if config.normalize_embedding else nn.Identity()
+        )
         # mbart has one extra layer_norm
-        self.layer_norm = bart.LayerNorm(config.d_model) if config.normalize_before else None
-
+        self.layer_norm = (
+            bart.LayerNorm(config.d_model) if config.normalize_before else None
+        )
 
     def forward(
-        self, input_ids, embedded=None, attention_mask=None,
+        self,
+        input_ids,
+        embedded=None,
+        attention_mask=None,
     ):
         """
         Args:
@@ -87,7 +100,8 @@ class AMRBartEncoder(nn.Module):
             attention_mask = bart.invert_mask(attention_mask)
 
         input_ids, backreferences = extract_backreferences(
-            input_ids, self.embed_tokens.num_embeddings, self.backpointer_idx)
+            input_ids, self.embed_tokens.num_embeddings, self.backpointer_idx
+        )
         inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
         embed_pos = self.embed_positions(input_ids)
         x = inputs_embeds + embed_pos
@@ -107,7 +121,9 @@ class AMRBartEncoder(nn.Module):
                 encoder_states.append(x)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):  # skip the layer
+            if self.training and (
+                dropout_probability < self.layerdrop
+            ):  # skip the layer
                 attn = None
             else:
                 x, attn = encoder_layer(x, attention_mask)
@@ -121,10 +137,13 @@ class AMRBartEncoder(nn.Module):
             encoder_states.append(x)
 
         # T x B x C -> B x T x C
-        encoder_states = [hidden_state.transpose(0, 1) for hidden_state in encoder_states]
+        encoder_states = [
+            hidden_state.transpose(0, 1) for hidden_state in encoder_states
+        ]
         x = x.transpose(0, 1)
 
         return x, encoder_states, all_attentions
+
 
 class AMRBartDecoder(nn.Module):
     """
@@ -135,7 +154,13 @@ class AMRBartDecoder(nn.Module):
         embed_tokens (torch.nn.Embedding): output embedding
     """
 
-    def __init__(self, config: bart.BartConfig, embed_tokens: nn.Embedding, backpointer_idx, amr_mode=True):
+    def __init__(
+        self,
+        config: bart.BartConfig,
+        embed_tokens: nn.Embedding,
+        backpointer_idx,
+        amr_mode=True,
+    ):
         super().__init__()
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
@@ -155,14 +180,22 @@ class AMRBartDecoder(nn.Module):
             )
         else:
             self.embed_positions = bart.LearnedPositionalEmbedding(
-                config.max_position_embeddings, embed_dim, self.padding_idx, #config.extra_pos_embeddings,
+                config.max_position_embeddings,
+                embed_dim,
+                self.padding_idx,  # config.extra_pos_embeddings,
             )
 
         self.layers = nn.ModuleList(
             [bart.DecoderLayer(config) for _ in range(config.decoder_layers)]
         )  # type: List[DecoderLayer]
-        self.layernorm_embedding = bart.LayerNorm(config.d_model) if config.normalize_embedding else nn.Identity()
-        self.layer_norm = bart.LayerNorm(config.d_model) if config.add_final_layer_norm else None
+        self.layernorm_embedding = (
+            bart.LayerNorm(config.d_model)
+            if config.normalize_embedding
+            else nn.Identity()
+        )
+        self.layer_norm = (
+            bart.LayerNorm(config.d_model) if config.add_final_layer_norm else None
+        )
 
         self.pointer_k = nn.Linear(config.d_model, config.d_model)
         # self.pointer_k.weight.data = self.layers[-1].self_attn.k_proj.weight.data.clone()
@@ -192,7 +225,7 @@ class AMRBartDecoder(nn.Module):
         decoder_causal_mask,
         decoder_cached_states=None,
         use_cache=False,
-        **unused
+        **unused,
     ):
         """
         Includes several features from "Jointly Learning to Align and
@@ -218,9 +251,8 @@ class AMRBartDecoder(nn.Module):
             encoder_padding_mask = bart.invert_mask(encoder_padding_mask)
 
         input_ids, backreferences = extract_backreferences(
-            input_ids,
-            self.embed_tokens.num_embeddings,
-            self.backpointer_idx)
+            input_ids, self.embed_tokens.num_embeddings, self.backpointer_idx
+        )
         # embed positions
         embed_pos = self.embed_positions(input_ids, use_cache=use_cache)
         positions = embed_pos
@@ -252,7 +284,11 @@ class AMRBartDecoder(nn.Module):
             if self.training and (dropout_probability < self.layerdrop):
                 continue
 
-            layer_state = decoder_cached_states[idx] if decoder_cached_states is not None else None
+            layer_state = (
+                decoder_cached_states[idx]
+                if decoder_cached_states is not None
+                else None
+            )
 
             x, layer_self_attn, layer_past = decoder_layer(
                 x,
@@ -272,7 +308,9 @@ class AMRBartDecoder(nn.Module):
                 all_self_attns += (layer_self_attn,)
 
         # Convert to standard output format: (seq_len, BS, model_dim) -> (BS, seq_len, model_dim)
-        all_hidden_states = [hidden_state.transpose(0, 1) for hidden_state in all_hidden_states]
+        all_hidden_states = [
+            hidden_state.transpose(0, 1) for hidden_state in all_hidden_states
+        ]
         x = x.transpose(0, 1)
         encoder_hidden_states = encoder_hidden_states.transpose(0, 1)
 
@@ -280,30 +318,35 @@ class AMRBartDecoder(nn.Module):
         xk = self.pointer_k(x)
 
         if decoder_cached_states is not None:
-            if 'prev_key' in decoder_cached_states[-1].get('pointer', {}):
-                last_state = decoder_cached_states[-1]['pointer']
-                xk = torch.cat([last_state['prev_key'], xk], dim=1)
+            if "prev_key" in decoder_cached_states[-1].get("pointer", {}):
+                last_state = decoder_cached_states[-1]["pointer"]
+                xk = torch.cat([last_state["prev_key"], xk], dim=1)
 
-        next_state = {'pointer': {'prev_key': xk}}
+        next_state = {"pointer": {"prev_key": xk}}
 
         if use_cache:
             next_decoder_cache.append(next_state)
 
         if self.amr_mode:
-            scores = torch.einsum('bqh,bkh->bqk', xq, xk)
+            scores = torch.einsum("bqh,bkh->bqk", xq, xk)
 
             if decoder_cached_states:
-                mask = torch.full_like(scores[0], float('-inf'))
+                mask = torch.full_like(scores[0], float("-inf"))
                 mask = mask.triu(diagonal=xk.size(1) - 1)
             else:
-                mask = torch.full_like(scores[0], float('-inf'))
+                mask = torch.full_like(scores[0], float("-inf"))
                 mask = mask.triu()
             scores += mask.unsqueeze(0)
         else:
-            scores = torch.full((xq.size(0), xq.size(1), xk.size(1)), float('-inf'), device=xq.device)
+            scores = torch.full(
+                (xq.size(0), xq.size(1), xk.size(1)), float("-inf"), device=xq.device
+            )
 
         if use_cache:
-            next_cache = ((encoder_hidden_states, encoder_padding_mask), next_decoder_cache)
+            next_cache = (
+                (encoder_hidden_states, encoder_padding_mask),
+                next_decoder_cache,
+            )
         else:
             next_cache = None
         return (x, scores), next_cache, all_hidden_states, list(all_self_attns)
@@ -323,8 +366,12 @@ class AMRBartModel(bart.PretrainedBartModel):
         else:
             self.backpointer_idx = self.shared.num_embeddings - 1
 
-        self.encoder = AMRBartEncoder(config, self.shared, backpointer_idx=self.backpointer_idx)
-        self.decoder = AMRBartDecoder(config, self.shared, backpointer_idx=self.backpointer_idx)
+        self.encoder = AMRBartEncoder(
+            config, self.shared, backpointer_idx=self.backpointer_idx
+        )
+        self.decoder = AMRBartDecoder(
+            config, self.shared, backpointer_idx=self.backpointer_idx
+        )
 
         self.init_weights()
 
@@ -350,19 +397,23 @@ class AMRBartModel(bart.PretrainedBartModel):
 
         # make masks if user doesn't supply
         if not use_cache:
-            decoder_input_ids, decoder_padding_mask, causal_mask = bart._prepare_bart_decoder_inputs(
-                self.config,
-                input_ids,
-                decoder_input_ids=decoder_input_ids,
-                decoder_padding_mask=decoder_attention_mask,
-                causal_mask_dtype=self.shared.weight.dtype,
+            decoder_input_ids, decoder_padding_mask, causal_mask = (
+                bart._prepare_bart_decoder_inputs(
+                    self.config,
+                    input_ids,
+                    decoder_input_ids=decoder_input_ids,
+                    decoder_padding_mask=decoder_attention_mask,
+                    causal_mask_dtype=self.shared.weight.dtype,
+                )
             )
         else:
             decoder_padding_mask, causal_mask = None, None
 
         assert decoder_input_ids is not None
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            encoder_outputs = self.encoder(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
         assert isinstance(encoder_outputs, tuple)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
@@ -401,7 +452,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         base_model = AMRBartModel(config, backpointer_idx)
         self.model = base_model
         self.pad_index = base_model.shared.padding_idx
-        self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
+        self.register_buffer(
+            "final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings))
+        )
         self.backpointer_idx = backpointer_idx
         self._rev = None
 
@@ -441,48 +494,48 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         decoder_cached_states=None,
         lm_labels=None,
         use_cache=False,
-        **unused
+        **unused,
     ):
         r"""
-        lm_labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
-            Labels for computing the masked language modeling loss.
-            Indices should either be in ``[0, ..., config.vocab_size]`` or -100 (see ``input_ids`` docstring).
-            Tokens with indices set to ``-100`` are ignored (masked), the loss is only computed for the tokens
-            with labels
-            in ``[0, ..., config.vocab_size]``.
+            lm_labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
+                Labels for computing the masked language modeling loss.
+                Indices should either be in ``[0, ..., config.vocab_size]`` or -100 (see ``input_ids`` docstring).
+                Tokens with indices set to ``-100`` are ignored (masked), the loss is only computed for the tokens
+                with labels
+                in ``[0, ..., config.vocab_size]``.
 
-    Returns:
-        :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~transformers.RobertaConfig`) and inputs:
-        masked_lm_loss (`optional`, returned when ``lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
-            Masked language modeling loss.
-        prediction_scores (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, config.vocab_size)`)
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_hidden_states=True``):
-            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
-            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+        Returns:
+            :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~transformers.RobertaConfig`) and inputs:
+            masked_lm_loss (`optional`, returned when ``lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+                Masked language modeling loss.
+            prediction_scores (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, config.vocab_size)`)
+                Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+            hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_hidden_states=True``):
+                Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+                of shape :obj:`(batch_size, sequence_length, hidden_size)`.
 
-            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_attentions=True``):
-            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape
-            :obj:`(batch_size, num_heads, sequence_length, sequence_length)`.
+                Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+            attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_attentions=True``):
+                Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape
+                :obj:`(batch_size, num_heads, sequence_length, sequence_length)`.
 
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
+                Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+                heads.
 
-    Examples::
+        Examples::
 
-            # Mask filling only works for bart-large
-            from transformers import BartTokenizer, BartForConditionalGeneration
-            tokenizer = BartTokenizer.from_pretrained('bart-large')
-            TXT = "My friends are <mask> but they eat too many carbs."
-            model = BartForConditionalGeneration.from_pretrained('bart-large')
-            input_ids = tokenizer.batch_encode_plus([TXT], return_tensors='pt')['input_ids']
-            logits = model(input_ids)[0]
-            masked_index = (input_ids[0] == tokenizer.mask_token_id).nonzero().item()
-            probs = logits[0, masked_index].softmax(dim=0)
-            values, predictions = probs.topk(5)
-            tokenizer.decode(predictions).split()
-            # ['good', 'great', 'all', 'really', 'very']
+                # Mask filling only works for bart-large
+                from transformers import BartTokenizer, BartForConditionalGeneration
+                tokenizer = BartTokenizer.from_pretrained('bart-large')
+                TXT = "My friends are <mask> but they eat too many carbs."
+                model = BartForConditionalGeneration.from_pretrained('bart-large')
+                input_ids = tokenizer.batch_encode_plus([TXT], return_tensors='pt')['input_ids']
+                logits = model(input_ids)[0]
+                masked_index = (input_ids[0] == tokenizer.mask_token_id).nonzero().item()
+                probs = logits[0, masked_index].softmax(dim=0)
+                values, predictions = probs.topk(5)
+                tokenizer.decode(predictions).split()
+                # ['good', 'great', 'all', 'really', 'very']
         """
         # outputs = self.model(
         #     input_ids,
@@ -517,7 +570,8 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             masked_lm_loss = F.nll_loss(
                 uni_logits.log_softmax(-1).contiguous().view(-1, uni_logits.size(-1)),
                 lm_labels.contiguous().view(-1),
-                ignore_index=self.pad_index)
+                ignore_index=self.pad_index,
+            )
             outputs = (masked_lm_loss,) + outputs
 
         return outputs
@@ -542,41 +596,45 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             use_cache=use_cache,
         )
 
-        lm_logits = F.linear(outputs[0][0], self.model.shared.weight, bias=self.final_logits_bias)
+        lm_logits = F.linear(
+            outputs[0][0], self.model.shared.weight, bias=self.final_logits_bias
+        )
         po_logits = outputs[0][1]
-        po_padding = torch.full_like(po_logits[:, :, 0:1], float('-inf'))
+        po_padding = torch.full_like(po_logits[:, :, 0:1], float("-inf"))
         po_padding = po_padding.repeat(1, 1, 1024 - po_logits.size(-1))
         po_logits = torch.cat([po_logits, po_padding], -1)
         uni_logits = torch.cat([lm_logits, po_logits], -1)
-        outputs = (uni_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
+        outputs = (uni_logits,) + outputs[
+            1:
+        ]  # Add cache, hidden states and attention if they are here
         return outputs
 
     @torch.no_grad()
     def generate(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            max_length: Optional[int] = None,
-            min_length: Optional[int] = None,
-            do_sample: Optional[bool] = None,
-            early_stopping: Optional[bool] = None,
-            num_beams: Optional[int] = None,
-            temperature: Optional[float] = None,
-            top_k: Optional[int] = None,
-            top_p: Optional[float] = None,
-            repetition_penalty: Optional[float] = None,
-            bad_words_ids: Optional[Iterable[int]] = None,
-            bos_token_id: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[int] = None,
-            length_penalty: Optional[float] = None,
-            no_repeat_ngram_size: Optional[int] = None,
-            num_return_sequences: Optional[int] = None,
-            attention_mask: Optional[torch.LongTensor] = None,
-            decoder_start_token_id: Optional[int] = None,
-            use_cache: Optional[bool] = None,
-            **model_specific_kwargs
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        max_length: Optional[int] = None,
+        min_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        early_stopping: Optional[bool] = None,
+        num_beams: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        bad_words_ids: Optional[Iterable[int]] = None,
+        bos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        length_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None,
+        num_return_sequences: Optional[int] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_start_token_id: Optional[int] = None,
+        use_cache: Optional[bool] = None,
+        **model_specific_kwargs,
     ) -> torch.LongTensor:
-        r""" Generates sequences for models with a LM head. The method currently supports greedy decoding, beam-search decoding, sampling with temperature, sampling with top-k or nucleus sampling.
+        r"""Generates sequences for models with a LM head. The method currently supports greedy decoding, beam-search decoding, sampling with temperature, sampling with top-k or nucleus sampling.
 
         Adapted in part from `Facebook's XLM beam search code`_.
 
@@ -708,26 +766,50 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         max_length = max_length if max_length is not None else self.config.max_length
         min_length = min_length if min_length is not None else self.config.min_length
         do_sample = do_sample if do_sample is not None else self.config.do_sample
-        early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
+        early_stopping = (
+            early_stopping if early_stopping is not None else self.config.early_stopping
+        )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         num_beams = num_beams if num_beams is not None else self.config.num_beams
-        temperature = temperature if temperature is not None else self.config.temperature
+        temperature = (
+            temperature if temperature is not None else self.config.temperature
+        )
         top_k = top_k if top_k is not None else self.config.top_k
         top_p = top_p if top_p is not None else self.config.top_p
-        repetition_penalty = repetition_penalty if repetition_penalty is not None else self.config.repetition_penalty
-        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
-        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
-        no_repeat_ngram_size = (
-            no_repeat_ngram_size if no_repeat_ngram_size is not None else self.config.no_repeat_ngram_size
+        repetition_penalty = (
+            repetition_penalty
+            if repetition_penalty is not None
+            else self.config.repetition_penalty
         )
-        bad_words_ids = bad_words_ids if bad_words_ids is not None else self.config.bad_words_ids
+        bos_token_id = (
+            bos_token_id if bos_token_id is not None else self.config.bos_token_id
+        )
+        pad_token_id = (
+            pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        )
+        eos_token_id = (
+            eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        )
+        length_penalty = (
+            length_penalty if length_penalty is not None else self.config.length_penalty
+        )
+        no_repeat_ngram_size = (
+            no_repeat_ngram_size
+            if no_repeat_ngram_size is not None
+            else self.config.no_repeat_ngram_size
+        )
+        bad_words_ids = (
+            bad_words_ids if bad_words_ids is not None else self.config.bad_words_ids
+        )
         num_return_sequences = (
-            num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
+            num_return_sequences
+            if num_return_sequences is not None
+            else self.config.num_return_sequences
         )
         decoder_start_token_id = (
-            decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+            decoder_start_token_id
+            if decoder_start_token_id is not None
+            else self.config.decoder_start_token_id
         )
 
         if input_ids is not None:
@@ -735,35 +817,47 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         else:
             batch_size = 1
 
-        assert isinstance(max_length, int) and max_length > 0, "`max_length` should be a strictly positive integer."
-        assert isinstance(min_length, int) and min_length >= 0, "`min_length` should be a positive integer."
+        assert isinstance(max_length, int) and max_length > 0, (
+            "`max_length` should be a strictly positive integer."
+        )
+        assert isinstance(min_length, int) and min_length >= 0, (
+            "`min_length` should be a positive integer."
+        )
         assert isinstance(do_sample, bool), "`do_sample` should be a boolean."
         assert isinstance(early_stopping, bool), "`early_stopping` should be a boolean."
         assert isinstance(use_cache, bool), "`use_cache` should be a boolean."
-        assert isinstance(num_beams, int) and num_beams > 0, "`num_beams` should be a strictly positive integer."
+        assert isinstance(num_beams, int) and num_beams > 0, (
+            "`num_beams` should be a strictly positive integer."
+        )
         assert temperature > 0, "`temperature` should be strictly positive."
-        assert isinstance(top_k, int) and top_k >= 0, "`top_k` should be a positive integer."
+        assert isinstance(top_k, int) and top_k >= 0, (
+            "`top_k` should be a positive integer."
+        )
         assert 0 <= top_p <= 1, "`top_p` should be between 0 and 1."
         assert repetition_penalty >= 1.0, "`repetition_penalty` should be >= 1."
         assert input_ids is not None or (
-                isinstance(bos_token_id, int) and bos_token_id >= 0
+            isinstance(bos_token_id, int) and bos_token_id >= 0
         ), "If input_ids is not defined, `bos_token_id` should be a positive integer."
         assert pad_token_id is None or (
-                isinstance(pad_token_id, int) and (pad_token_id >= 0)
+            isinstance(pad_token_id, int) and (pad_token_id >= 0)
         ), "`pad_token_id` should be a positive integer."
         assert (eos_token_id is None) or (
-                isinstance(eos_token_id, int) and (eos_token_id >= 0)
+            isinstance(eos_token_id, int) and (eos_token_id >= 0)
         ), "`eos_token_id` should be a positive integer."
         assert length_penalty > 0, "`length_penalty` should be strictly positive."
+        assert isinstance(no_repeat_ngram_size, int) and no_repeat_ngram_size >= 0, (
+            "`no_repeat_ngram_size` should be a positive integer."
+        )
+        assert isinstance(num_return_sequences, int) and num_return_sequences > 0, (
+            "`num_return_sequences` should be a strictly positive integer."
+        )
         assert (
-                isinstance(no_repeat_ngram_size, int) and no_repeat_ngram_size >= 0
-        ), "`no_repeat_ngram_size` should be a positive integer."
-        assert (
-                isinstance(num_return_sequences, int) and num_return_sequences > 0
-        ), "`num_return_sequences` should be a strictly positive integer."
-        assert (
-                bad_words_ids is None or isinstance(bad_words_ids, list) and isinstance(bad_words_ids[0], list)
-        ), "`bad_words_ids` is either `None` or a list of lists of tokens that should not be generated"
+            bad_words_ids is None
+            or isinstance(bad_words_ids, list)
+            and isinstance(bad_words_ids[0], list)
+        ), (
+            "`bad_words_ids` is either `None` or a list of lists of tokens that should not be generated"
+        )
 
         if input_ids is None:
             assert isinstance(bos_token_id, int) and bos_token_id >= 0, (
@@ -771,28 +865,37 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
                 "or a `bos_token_id` (integer >= 0) as a first token to start the generation."
             )
             input_ids = torch.full(
-                (batch_size, 1), bos_token_id, dtype=torch.long, device=next(self.parameters()).device,
+                (batch_size, 1),
+                bos_token_id,
+                dtype=torch.long,
+                device=next(self.parameters()).device,
             )
         else:
-            assert input_ids.dim() == 2, "Input prompt should be of shape (batch_size, sequence length)."
+            assert input_ids.dim() == 2, (
+                "Input prompt should be of shape (batch_size, sequence length)."
+            )
 
         # not allow to duplicate outputs when greedy decoding
         if do_sample is False:
             if num_beams == 1:
                 # no_beam_search greedy generation conditions
-                assert (
-                        num_return_sequences == 1
-                ), "Greedy decoding will always produce the same output for num_beams == 1 and num_return_sequences > 1. Please set num_return_sequences = 1"
+                assert num_return_sequences == 1, (
+                    "Greedy decoding will always produce the same output for num_beams == 1 and num_return_sequences > 1. Please set num_return_sequences = 1"
+                )
 
             else:
                 # beam_search greedy generation conditions
-                assert (
-                        num_beams >= num_return_sequences
-                ), "Greedy beam search decoding cannot return more sequences than it has beams. Please set num_beams >= num_return_sequences"
+                assert num_beams >= num_return_sequences, (
+                    "Greedy beam search decoding cannot return more sequences than it has beams. Please set num_beams >= num_return_sequences"
+                )
 
         # create attention mask if necessary
         # TODO (PVP): this should later be handled by the forward fn() in each model in the future see PR 3140
-        if (attention_mask is None) and (pad_token_id is not None) and (pad_token_id in input_ids):
+        if (
+            (attention_mask is None)
+            and (pad_token_id is not None)
+            and (pad_token_id in input_ids)
+        ):
             attention_mask = input_ids.ne(pad_token_id).long()
         elif attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
@@ -801,7 +904,7 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         # attention_mask is created
         if pad_token_id is None and eos_token_id is not None:
             logger.warning(
-                "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
+                f"Setting `pad_token_id` to {eos_token_id} (first `eos_token_id`) to generate sequence"
             )
             pad_token_id = eos_token_id
 
@@ -809,9 +912,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         if hasattr(self.config, "vocab_size"):
             vocab_size = self.config.vocab_size
         elif (
-                self.config.is_encoder_decoder
-                and hasattr(self.config, "decoder")
-                and hasattr(self.config.decoder, "vocab_size")
+            self.config.is_encoder_decoder
+            and hasattr(self.config, "decoder")
+            and hasattr(self.config.decoder, "vocab_size")
         ):
             vocab_size = self.config.decoder.vocab_size
 
@@ -829,11 +932,13 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             if decoder_start_token_id is None:
                 decoder_start_token_id = bos_token_id
 
-            assert (
-                    decoder_start_token_id is not None
-            ), "decoder_start_token_id or bos_token_id has to be defined for encoder-decoder generation"
-            assert hasattr(self, "get_encoder"), "{} should have a 'get_encoder' function defined".format(self)
-            assert callable(self.get_encoder), "{} should be a method".format(self.get_encoder)
+            assert decoder_start_token_id is not None, (
+                "decoder_start_token_id or bos_token_id has to be defined for encoder-decoder generation"
+            )
+            assert hasattr(self, "get_encoder"), (
+                f"{self} should have a 'get_encoder' function defined"
+            )
+            assert callable(self.get_encoder), f"{self.get_encoder} should be a method"
 
             # get encoder and store encoder outputs
             encoder = self.get_encoder()
@@ -843,7 +948,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         # Expand input ids if num_beams > 1 or num_return_sequences > 1
         if num_return_sequences > 1 or num_beams > 1:
             input_ids_len = input_ids.shape[-1]
-            input_ids = input_ids.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len)
+            input_ids = input_ids.unsqueeze(1).expand(
+                batch_size, effective_batch_mult * num_beams, input_ids_len
+            )
             attention_mask = attention_mask.unsqueeze(1).expand(
                 batch_size, effective_batch_mult * num_beams, input_ids_len
             )
@@ -865,20 +972,23 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             )
             cur_len = 1
 
-            assert (
-                    batch_size == encoder_outputs[0].shape[0]
-            ), f"expected encoder_outputs[0] to have 1st dimension bs={batch_size}, got {encoder_outputs[0].shape[0]} "
+            assert batch_size == encoder_outputs[0].shape[0], (
+                f"expected encoder_outputs[0] to have 1st dimension bs={batch_size}, got {encoder_outputs[0].shape[0]} "
+            )
 
             # expand batch_idx to assign correct encoder output for expanded input_ids (due to num_beams > 1 and num_return_sequences > 1)
             expanded_batch_idxs = (
                 torch.arange(batch_size)
-                    .view(-1, 1)
-                    .repeat(1, num_beams * effective_batch_mult)
-                    .view(-1)
-                    .to(input_ids.device)
+                .view(-1, 1)
+                .repeat(1, num_beams * effective_batch_mult)
+                .view(-1)
+                .to(input_ids.device)
             )
             # expand encoder_outputs
-            encoder_outputs = (encoder_outputs[0].index_select(0, expanded_batch_idxs), *encoder_outputs[1:])
+            encoder_outputs = (
+                encoder_outputs[0].index_select(0, expanded_batch_idxs),
+                *encoder_outputs[1:],
+            )
 
         else:
             encoder_outputs = None
@@ -966,17 +1076,20 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         use_cache,
         model_specific_kwargs,
     ):
-        """ Generate sequences for each example with beam search.
-        """
+        """Generate sequences for each example with beam search."""
 
         # generated hypotheses
         generated_hyps = [
-            BeamHypotheses(num_beams, max_length, length_penalty, early_stopping=early_stopping)
+            BeamHypotheses(
+                num_beams, max_length, length_penalty, early_stopping=early_stopping
+            )
             for _ in range(batch_size)
         ]
 
         # scores for each sentence in the beam
-        beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+        beam_scores = torch.zeros(
+            (batch_size, num_beams), dtype=torch.float, device=input_ids.device
+        )
 
         # for greedy decoding it is made sure that only tokens of the first beam are considered to avoid sampling the exact same tokens three times
         if do_sample is False:
@@ -991,10 +1104,18 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
 
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache, **model_specific_kwargs
+                input_ids,
+                past=past,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                **model_specific_kwargs,
             )
-            outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
-            next_token_logits = outputs[0][:, -1, :]  # (batch_size * num_beams, vocab_size)
+            outputs = self(
+                **model_inputs
+            )  # (batch_size * num_beams, cur_len, vocab_size)
+            next_token_logits = outputs[0][
+                :, -1, :
+            ]  # (batch_size * num_beams, vocab_size)
 
             # if model has past, then set the past variable to speed up decoding
             if self._use_cache(outputs, use_cache):
@@ -1003,7 +1124,11 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             # repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858)
             if repetition_penalty != 1.0:
                 self.enforce_repetition_penalty_(
-                    next_token_logits, batch_size, num_beams, input_ids, repetition_penalty,
+                    next_token_logits,
+                    batch_size,
+                    num_beams,
+                    input_ids,
+                    repetition_penalty,
                 )
 
             if temperature != 1.0:
@@ -1015,7 +1140,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
                     next_token_logits, cur_len=cur_len, max_length=max_length
                 )
 
-            scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
+            scores = F.log_softmax(
+                next_token_logits, dim=-1
+            )  # (batch_size * num_beams, vocab_size)
 
             # set eos token prob to zero if min_length is not reached
             if eos_token_id is not None and cur_len < min_length:
@@ -1038,12 +1165,14 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
                 for i, banned_tokens in enumerate(banned_tokens):
                     scores[i, banned_tokens] = -float("inf")
 
-            assert scores.shape == (batch_size * num_beams, vocab_size), "Shapes of scores: {} != {}".format(
-                scores.shape, (batch_size * num_beams, vocab_size)
+            assert scores.shape == (batch_size * num_beams, vocab_size), (
+                f"Shapes of scores: {scores.shape} != {(batch_size * num_beams, vocab_size)}"
             )
 
             if do_sample:
-                _scores = scores + beam_scores[:, None].expand_as(scores)  # (batch_size * num_beams, vocab_size)
+                _scores = scores + beam_scores[:, None].expand_as(
+                    scores
+                )  # (batch_size * num_beams, vocab_size)
                 # Top-p/top-k filtering
                 _scores = top_k_top_p_filtering(
                     _scores, top_k=top_k, top_p=top_p, min_tokens_to_keep=2
@@ -1055,40 +1184,55 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
 
                 # Sample 2 next tokens for each beam (so we have some spare tokens and match output of greedy beam search)
                 probs = F.softmax(_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=2 * num_beams)  # (batch_size, num_beams * 2)
+                next_tokens = torch.multinomial(
+                    probs, num_samples=2 * num_beams
+                )  # (batch_size, num_beams * 2)
                 # Compute next scores
-                next_scores = torch.gather(_scores, -1, next_tokens)  # (batch_size, num_beams * 2)
+                next_scores = torch.gather(
+                    _scores, -1, next_tokens
+                )  # (batch_size, num_beams * 2)
                 # sort the sampled vector to make sure that the first num_beams samples are the best
-                next_scores, next_scores_indices = torch.sort(next_scores, descending=True, dim=1)
-                next_tokens = torch.gather(next_tokens, -1, next_scores_indices)  # (batch_size, num_beams * 2)
+                next_scores, next_scores_indices = torch.sort(
+                    next_scores, descending=True, dim=1
+                )
+                next_tokens = torch.gather(
+                    next_tokens, -1, next_scores_indices
+                )  # (batch_size, num_beams * 2)
 
             else:
-                next_scores = scores + beam_scores[:, None].expand_as(scores)  # (batch_size * num_beams, vocab_size)
+                next_scores = scores + beam_scores[:, None].expand_as(
+                    scores
+                )  # (batch_size * num_beams, vocab_size)
 
                 # re-organize to group the beam together (we are keeping top hypothesis accross beams)
                 next_scores = next_scores.view(
                     batch_size, num_beams * vocab_size
                 )  # (batch_size, num_beams * vocab_size)
 
-                next_scores, next_tokens = torch.topk(next_scores, 2 * num_beams, dim=1, largest=True, sorted=True)
+                next_scores, next_tokens = torch.topk(
+                    next_scores, 2 * num_beams, dim=1, largest=True, sorted=True
+                )
 
-            assert next_scores.size() == next_tokens.size() == (batch_size, 2 * num_beams)
+            assert (
+                next_scores.size() == next_tokens.size() == (batch_size, 2 * num_beams)
+            )
 
             # next batch beam content
             next_batch_beam = []
 
             # for each sentence
             for batch_idx in range(batch_size):
-
                 # if we are done with this sentence
                 if done[batch_idx]:
-                    assert (
-                        len(generated_hyps[batch_idx]) >= num_beams
-                    ), "Batch can only be done if at least {} beams have been generated".format(num_beams)
-                    assert (
-                        eos_token_id is not None and pad_token_id is not None
-                    ), "generated beams >= num_beams -> eos_token_id and pad_token have to be defined"
-                    next_batch_beam.extend([(0, pad_token_id, 0)] * num_beams)  # pad the batch
+                    assert len(generated_hyps[batch_idx]) >= num_beams, (
+                        f"Batch can only be done if at least {num_beams} beams have been generated"
+                    )
+                    assert eos_token_id is not None and pad_token_id is not None, (
+                        "generated beams >= num_beams -> eos_token_id and pad_token have to be defined"
+                    )
+                    next_batch_beam.extend(
+                        [(0, pad_token_id, 0)] * num_beams
+                    )  # pad the batch
                     continue
 
                 # next sentence beam content
@@ -1106,15 +1250,20 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
                     # add to generated hypotheses if end of sentence or last iteration
                     if (eos_token_id is not None) and (token_id.item() == eos_token_id):
                         # if beam_token does not belong to top num_beams tokens, it should not be added
-                        is_beam_token_worse_than_top_num_beams = beam_token_rank >= num_beams
+                        is_beam_token_worse_than_top_num_beams = (
+                            beam_token_rank >= num_beams
+                        )
                         if is_beam_token_worse_than_top_num_beams:
                             continue
                         generated_hyps[batch_idx].add(
-                            input_ids[effective_beam_id].clone(), beam_token_score.item(),
+                            input_ids[effective_beam_id].clone(),
+                            beam_token_score.item(),
                         )
                     else:
                         # add next predicted token if it is not eos_token
-                        next_sent_beam.append((beam_token_score, token_id, effective_beam_id))
+                        next_sent_beam.append(
+                            (beam_token_score, token_id, effective_beam_id)
+                        )
 
                     # the beam for next step is full
                     if len(next_sent_beam) == num_beams:
@@ -1152,7 +1301,11 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             # extend attention_mask for new generated input if only decoder
             if self.config.is_encoder_decoder is False:
                 attention_mask = torch.cat(
-                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                    [
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], 1)),
+                    ],
+                    dim=-1,
                 )
 
         # finalize all open beam hypotheses and end to generated hypotheses
@@ -1162,12 +1315,14 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
 
             # test that beam scores match previously calculated scores if not eos and batch_idx not done
             if eos_token_id is not None and all(
-                (token_id % vocab_size).item() is not eos_token_id for token_id in next_tokens[batch_idx]
+                (token_id % vocab_size).item() is not eos_token_id
+                for token_id in next_tokens[batch_idx]
             ):
                 assert torch.all(
-                    next_scores[batch_idx, :num_beams] == beam_scores.view(batch_size, num_beams)[batch_idx]
-                ), "If batch_idx is not done, final next scores: {} have to equal to accumulated beam_scores: {}".format(
-                    next_scores[:, :num_beams][batch_idx], beam_scores.view(batch_size, num_beams)[batch_idx],
+                    next_scores[batch_idx, :num_beams]
+                    == beam_scores.view(batch_size, num_beams)[batch_idx]
+                ), (
+                    f"If batch_idx is not done, final next scores: {next_scores[:, :num_beams][batch_idx]} have to equal to accumulated beam_scores: {beam_scores.view(batch_size, num_beams)[batch_idx]}"
                 )
 
             # need to add best num_beams hypotheses to generated hyps
@@ -1178,7 +1333,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
                 generated_hyps[batch_idx].add(final_tokens, final_score)
 
         # depending on whether greedy generation is wanted or not define different output_batch_size and output_num_return_sequences_per_batch
-        output_batch_size = batch_size if do_sample else batch_size * num_return_sequences
+        output_batch_size = (
+            batch_size if do_sample else batch_size * num_return_sequences
+        )
         output_num_return_sequences_per_batch = 1 if do_sample else num_return_sequences
 
         # select the best hypotheses
@@ -1208,7 +1365,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         else:
             # none of the hypotheses have an eos_token
             assert (len(hypo) == max_length for hypo in best)
-            decoded = torch.stack(best).type(torch.long).to(next(self.parameters()).device)
+            decoded = (
+                torch.stack(best).type(torch.long).to(next(self.parameters()).device)
+            )
 
         return decoded
 
@@ -1223,15 +1382,22 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         self._resize_final_logits_bias(new_num_tokens, old_num_tokens)
         return new_embeddings
 
-    def _resize_final_logits_bias(self, new_num_tokens: int, old_num_tokens: int) -> None:
+    def _resize_final_logits_bias(
+        self, new_num_tokens: int, old_num_tokens: int
+    ) -> None:
         if new_num_tokens <= old_num_tokens:
             new_bias = self.final_logits_bias[:, :new_num_tokens]
         else:
-            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            extra_bias = torch.zeros(
+                (1, new_num_tokens - old_num_tokens),
+                device=self.final_logits_bias.device,
+            )
             new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
         self.register_buffer("final_logits_bias", new_bias)
 
-    def prepare_inputs_for_generation(self, decoder_input_ids, past, attention_mask, use_cache, **kwargs):
+    def prepare_inputs_for_generation(
+        self, decoder_input_ids, past, attention_mask, use_cache, **kwargs
+    ):
         assert past is not None, "past has to be defined for encoder_outputs"
 
         # first step, decoder_cached_states are empty
@@ -1249,7 +1415,7 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         }
 
     def prepare_logits_for_generation(self, logits, cur_len, max_length):
-        #if cur_len == 1:
+        # if cur_len == 1:
         #    self._force_token_ids_generation(logits, self.config.bos_token_id)
         if cur_len == max_length - 1 and self.config.eos_token_id is not None:
             self._force_token_ids_generation(logits, self.config.eos_token_id)
@@ -1264,7 +1430,9 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
             dtype=torch.long,
             device=next(self.parameters()).device,
         )
-        assert len(scores.shape) == 2, "scores should be of rank 2 with shape: [batch_size, vocab_size]"
+        assert len(scores.shape) == 2, (
+            "scores should be of rank 2 with shape: [batch_size, vocab_size]"
+        )
         scores[:, all_but_token_ids_mask] = -float("inf")
 
     @staticmethod
@@ -1274,12 +1442,15 @@ class AMRBartForConditionalGeneration(bart.PretrainedBartModel):
         for layer_past in decoder_cached_states:
             # get the correct batch idx from decoder layer's batch dim for cross and self-attn
             layer_past_new = {
-                attn_key: bart._reorder_buffer(attn_cache, beam_idx) for attn_key, attn_cache in layer_past.items()
+                attn_key: bart._reorder_buffer(attn_cache, beam_idx)
+                for attn_key, attn_cache in layer_past.items()
             }
             reordered_past.append(layer_past_new)
 
         new_enc_out = enc_out if enc_out is None else enc_out.index_select(0, beam_idx)
-        new_enc_mask = enc_mask if enc_mask is None else enc_mask.index_select(0, beam_idx)
+        new_enc_mask = (
+            enc_mask if enc_mask is None else enc_mask.index_select(0, beam_idx)
+        )
 
         past = ((new_enc_out, new_enc_mask), reordered_past)
         return past

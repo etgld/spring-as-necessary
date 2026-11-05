@@ -10,17 +10,17 @@ from spring_amr.tokenization_bart import AMRBartTokenizer, PENMANBartTokenizer
 
 
 def instantiate_model_and_tokenizer(
-        name=None,
-        checkpoint=None,
-        additional_tokens_smart_init=True,
-        dropout = 0.15,
-        attention_dropout = 0.15,
-        from_pretrained = True,
-        init_reverse = False,
-        collapse_name_ops = False,
-        penman_linearization = False,
-        use_pointer_tokens = False,
-        raw_graph = False,
+    name=None,
+    checkpoint=None,
+    additional_tokens_smart_init=True,
+    dropout=0.15,
+    attention_dropout=0.15,
+    from_pretrained=True,
+    init_reverse=False,
+    collapse_name_ops=False,
+    penman_linearization=False,
+    use_pointer_tokens=False,
+    raw_graph=False,
 ):
     if raw_graph:
         assert penman_linearization
@@ -28,10 +28,10 @@ def instantiate_model_and_tokenizer(
     skip_relations = False
 
     if name is None:
-        name = 'facebook/bart-large'
+        name = "facebook/bart-large"
 
-    if name == 'facebook/bart-base':
-        tokenizer_name = 'facebook/bart-large'
+    if name == "facebook/bart-base":
+        tokenizer_name = "facebook/bart-large"
     else:
         tokenizer_name = name
 
@@ -74,31 +74,30 @@ def instantiate_model_and_tokenizer(
             if idx < tokenizer.old_enc_size:
                 continue
 
-            elif tok.startswith('<pointer:') and tok.endswith('>'):
-                tok_split = ['pointer', str(tok.split(':')[1].strip('>'))]
+            elif tok.startswith("<pointer:") and tok.endswith(">"):
+                tok_split = ["pointer", str(tok.split(":")[1].strip(">"))]
 
-            elif tok.startswith('<'):
+            elif tok.startswith("<"):
                 continue
 
-            elif tok.startswith(':'):
-
+            elif tok.startswith(":"):
                 if skip_relations:
                     continue
 
-                elif tok.startswith(':op'):
-                    tok_split = ['relation', 'operator', str(int(tok[3:]))]
+                elif tok.startswith(":op"):
+                    tok_split = ["relation", "operator", str(int(tok[3:]))]
 
-                elif tok.startswith(':snt'):
-                    tok_split = ['relation', 'sentence', str(int(tok[4:]))]
+                elif tok.startswith(":snt"):
+                    tok_split = ["relation", "sentence", str(int(tok[4:]))]
 
-                elif tok.startswith(':ARG'):
-                    tok_split = ['relation', 'argument', str(int(tok[4:]))]
+                elif tok.startswith(":ARG"):
+                    tok_split = ["relation", "argument", str(int(tok[4:]))]
 
                 else:
-                    tok_split = ['relation'] + tok.lstrip(':').split('-')
+                    tok_split = ["relation"] + tok.lstrip(":").split("-")
 
             else:
-                tok_split = tok.split('-')
+                tok_split = tok.split("-")
 
             tok_split_ = tok_split
             tok_split = []
@@ -127,21 +126,21 @@ def instantiate_model_and_tokenizer(
         model.init_reverse_model()
 
     if checkpoint is not None:
-        model.load_state_dict(torch.load(checkpoint, map_location='cpu')['model'])
+        model.load_state_dict(torch.load(checkpoint, map_location="cpu")["model"])
 
     return model, tokenizer
 
 
 def instantiate_loader(
-        glob_pattn,
-        tokenizer,
-        batch_size=500,
-        evaluation=True,
-        out=None,
-        use_recategorization=False,
-        remove_longer_than=None,
-        remove_wiki=False,
-        dereify=True,
+    glob_pattn,
+    tokenizer,
+    batch_size=500,
+    evaluation=True,
+    out=None,
+    use_recategorization=False,
+    remove_longer_than=None,
+    remove_wiki=False,
+    dereify=True,
 ):
     paths = []
     if isinstance(glob_pattn, str) or isinstance(glob_pattn, Path):
@@ -150,8 +149,7 @@ def instantiate_loader(
         paths += [Path(p) for p in glob(gpattn)]
     if evaluation:
         assert out is not None
-        Path(out).write_text(
-            '\n\n'.join([p.read_text() for p in paths]))
+        Path(out).write_text("\n\n".join([p.read_text() for p in paths]))
     dataset = AMRDataset(
         paths,
         tokenizer,
